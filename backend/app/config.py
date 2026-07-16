@@ -15,7 +15,7 @@ def get_database_url_from_supabase(supabase_url: str) -> Optional[str]:
         return None
 
     # Extract project ref from URL
-    # https://fahknapjoqocoprkptar.supabase.co -> fahknapjoqocoprkptar
+    # https://abcxyzproject.supabase.co -> abcxyzproject
     try:
         import re
         match = re.search(r'https://([a-z]+)\.supabase\.co', supabase_url)
