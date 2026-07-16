@@ -588,51 +588,9 @@ user has permission to use the Docker socket.
 
 ---
 
-## FAQ
-
-**Does this need a GPU?**
-No. All model choices were deliberately picked to run on CPU-only hardware.
-
-**Why two different database clients in `backend/app/utils/`?**
-`supabase_client.py` is the one actually connected and used everywhere.
-`database_client.py` is a leftover asyncpg-based implementation from an
-earlier iteration of the project that is never instantiated in `main.py`.
-It's dead code — safe to ignore or delete.
-
-**Is there a background scheduler for the Intelligence Feed?**
-Not currently, despite `apscheduler` being listed as a dependency. Feed
-generation must be triggered manually via the API. See Future Scope in the
-accompanying project report for what a scheduled version would look like.
-
-**Why does one of the RSS sources (Reuters) always fail?**
-The configured Reuters feed URL returns HTTP 404 as of this writing —
-likely a discontinued or moved feed. The other 7 sources work fine; this
-doesn't block anything, it just means Reuters contributes zero articles.
-
-**Are there automated tests?**
-No — there is no test suite, and no `pytest` or `ruff` configuration in
-this repository, despite references to them in earlier drafts of this
-README. Manual end-to-end testing was used throughout development instead.
-
----
-
-## Contributing
-
-This was developed as an individual internship project rather than an
-open-collaboration codebase, so there's no formal contribution process.
-If you fork this and want to extend it, the places most worth touching
-first are: adding a real scheduler for the PIE (Section "Architecture"
-above explains what currently has to be triggered manually), adding a test
-suite (none currently exists), and implementing the cluster-merge logic
-described as future work in the project report (near-duplicate topic
-clusters aren't currently merged).
-
----
-
 ## Known Issues & Housekeeping
 
-Carried over from a full source audit — none of these block normal use,
-but are worth knowing about:
+None of these block normal use, but are worth knowing about:
 
 - `@supabase/supabase-js` in `package.json` and `database_client.py` in
   the backend are both dead/unused code, safe to remove.
@@ -649,4 +607,4 @@ but are worth knowing about:
 
 ## License
 
-MIT License — Intern MVP Project
+MIT License
