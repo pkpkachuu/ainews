@@ -5,25 +5,14 @@ Handles hybrid search, semantic search, and keyword search endpoints.
 
 from fastapi import APIRouter, Query, HTTPException
 from typing import Optional, List, Dict, Any
-from datetime import datetime
 from pydantic import BaseModel
+import httpx
+import structlog
 
 from app.utils.elasticsearch_client import es_client
 from app.services.reranker import reranker
-from sentence_transformers import SentenceTransformer
 
-# Lazy load embedding model
-_embedding_model = None
-
-
-def get_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
-        from app.config import settings
-        _embedding_model = SentenceTransformer(settings.embedding_model)
-    return _embedding_model
-
-
+logger = structlog.get_logger()
 router = APIRouter(prefix="/search", tags=["search"])
 
 
@@ -44,32 +33,54 @@ class SearchResponse(BaseModel):
     used_reranking: bool
 
 
+async def get_query_embedding_from_api(query: str) -> List[float]:
+    """Fetch query embedding from Hugging Face's free serverless Inference API."""
+    url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+    headers = {}
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                url,
+                json={"inputs": query},
+                headers=headers,
+                timeout=10.0
+            )
+            if response.status_code == 200:
+                embedding = response.json()
+                if isinstance(embedding, list) and len(embedding) > 0:
+                    return embedding
+                raise ValueError("Unexpected API response format")
+            else:
+                logger.error("hf_api_error", status_code=response.status_code, text=response.text)
+                raise HTTPException(status_code=502, detail="Failed to generate embedding from Hugging Face API")
+        except Exception as e:
+            logger.error("hf_api_exception", error=str(e))
+            raise HTTPException(status_code=502, detail="Embedding generation timed out or failed")
+
+
 @router.post("", response_model=SearchResponse)
 async def hybrid_search(request: SearchRequest):
-    """Perform hybrid search combining BM25 and semantic retrieval.
-
-    Optionally reranks results using cross-encoder model.
-    """
+    """Perform hybrid search combining BM25 and semantic retrieval."""
     import time
     start_time = time.time()
 
     if not request.query or len(request.query.strip()) < 2:
         raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
 
-    # Generate query embedding
-    model = get_embedding_model()
-    query_embedding = model.encode(request.query, normalize_embeddings=True).tolist()
+    # Generate query embedding using HF free API (No PyTorch loaded in memory!)
+    query_embedding = await get_query_embedding_from_api(request.query)
 
-    # Perform hybrid search with RRF
+    # Perform hybrid search with RRF on Elastic Serverless
     results = await es_client.hybrid_search_rrf(
         query=request.query,
         query_vector=query_embedding,
         filters=request.filters,
-        k=request.size * 2,  # Get more candidates for reranking
+        k=request.size * 2,
         num_candidates=100
     )
 
-    # Apply reranking if requested
+    # Apply lightweight reranking (recency boost)
     if request.use_reranking and len(results) > 5:
         results = await reranker.rerank(request.query, results, top_k=request.size)
 
@@ -134,9 +145,7 @@ async def semantic_search(
     import time
     start_time = time.time()
 
-    # Generate query embedding
-    model = get_embedding_model()
-    query_embedding = model.encode(query, normalize_embeddings=True).tolist()
+    query_embedding = await get_query_embedding_from_api(query)
 
     filters = {}
     if source:
@@ -169,7 +178,6 @@ async def find_similar(
     size: int = Query(10, ge=1, le=50)
 ):
     """Find articles similar to a given article using vector search."""
-    # Get the article's embedding
     article = await es_client.client.get(index="articles", id=article_id, _source=["embedding", "title"])
     if not article or "embedding" not in article["_source"]:
         raise HTTPException(status_code=404, detail="Article not found or no embedding")
@@ -177,14 +185,12 @@ async def find_similar(
     embedding = article["_source"]["embedding"]
     title = article["_source"].get("title", "")
 
-    # Search for similar articles
     results = await es_client.search_knn(
         query_vector=embedding,
-        k=size + 1,  # +1 because the article itself will be included
+        k=size + 1,
         num_candidates=50
     )
 
-    # Filter out the original article
     results = [r for r in results if r.get("article_id") != article_id][:size]
 
     return {
