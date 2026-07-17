@@ -1,0 +1,26 @@
+[supervisord]
+nodaemon=true
+user=user
+logfile=/tmp/supervisord.log
+pidfile=/tmp/supervisord.pid
+
+[program:redis]
+command=redis-server --port 6379 --bind 127.0.0.1 --protected-mode yes
+stdout_logfile=/tmp/redis.log
+stderr_logfile=/tmp/redis.err
+autorestart=true
+
+[program:elasticsearch]
+command=/app/elasticsearch/bin/elasticsearch -E node.store.allow_mmap=false -E discovery.type=single-node -E xpack.security.enabled=false -E path.data=/tmp/es-data -E path.logs=/tmp/es-logs
+environment=ES_JAVA_OPTS="-Xms512m -Xmx512m"
+stdout_logfile=/tmp/es.log
+stderr_logfile=/tmp/es.err
+autorestart=true
+startsecs=15
+
+[program:fastapi]
+command=uvicorn app.main:app --host 0.0.0.0 --port 7860
+directory=/app/backend
+stdout_logfile=/tmp/fastapi.log
+stderr_logfile=/tmp/fastapi.err
+autorestart=true

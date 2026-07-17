@@ -1,0 +1,35 @@
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y \
+    redis-server \
+    supervisor \
+    curl \
+    procps \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 user
+WORKDIR /app
+
+RUN curl -L https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-8.12.0-linux-x86_64.tar.gz -o elasticsearch.tar.gz \
+    && tar -xzf elasticsearch.tar.gz \
+    && rm elasticsearch.tar.gz \
+    && mv elasticsearch-8.12.0 elasticsearch
+
+RUN chown -R 1000:1000 /app
+
+USER user
+ENV PATH="/home/user/.local/bin:${PATH}"
+
+COPY --chown=user:user backend/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY --chown=user:user backend/ /app/backend/
+
+COPY --chown=user:user supervisord.conf /app/supervisord.conf
+COPY --chown=user:user start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+EXPOSE 7860
+
+CMD ["/app/start.sh"]

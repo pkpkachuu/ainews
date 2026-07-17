@@ -1,11 +1,16 @@
 """Elasticsearch client and index management."""
 
+import os
+from dotenv import load_dotenv
 from elasticsearch import AsyncElasticsearch
 from elasticsearch.helpers import async_bulk
 from typing import Optional, List, Dict, Any
 import structlog
 
 from app.config import settings
+
+# Load .env variables into system environment
+load_dotenv()
 
 logger = structlog.get_logger()
 
@@ -53,10 +58,6 @@ ARTICLES_INDEX_MAPPING = {
             "created_at": {"type": "date"},
             "indexed_at": {"type": "date"}
         }
-    },
-    "settings": {
-        "number_of_shards": 1,
-        "number_of_replicas": 0
     }
 }
 
@@ -86,10 +87,6 @@ EVENTS_INDEX_MAPPING = {
                 "similarity": "cosine"
             }
         }
-    },
-    "settings": {
-        "number_of_shards": 1,
-        "number_of_replicas": 0
     }
 }
 
@@ -102,19 +99,23 @@ class ElasticsearchClient:
 
     async def connect(self) -> None:
         """Initialize Elasticsearch connection."""
-        self.client = AsyncElasticsearch(
-            [settings.elasticsearch_url],
-            verify_certs=False,
-            # Narrative monitoring fires ~3 ES calls per tracked entity
-            # concurrently across up to 20 entities - default pool size (~10)
-            # and default request_timeout were causing queued requests to
-            # time out under that load, especially on a single local ES node
-            # sharing the machine with spaCy/embedding model processes.
-            max_retries=2,
-            retry_on_timeout=True,
-            request_timeout=30,
-            connections_per_node=25
-        )
+        api_key = os.getenv("ELASTICSEARCH_API_KEY")
+        
+        if api_key:
+            # Serverless authentication using API Key (Timeout increased to 120s)
+            self.client = AsyncElasticsearch(
+                settings.elasticsearch_url,
+                api_key=api_key,
+                verify_certs=False,
+                request_timeout=120
+            )
+        else:
+            # Standard authentication using basic auth URL (Timeout increased to 120s)
+            self.client = AsyncElasticsearch(
+                [settings.elasticsearch_url],
+                verify_certs=False,
+                request_timeout=120
+            )
         logger.info("elasticsearch_connected", url=settings.elasticsearch_url)
 
     async def disconnect(self) -> None:
@@ -478,13 +479,7 @@ class ElasticsearchClient:
         hours: int = 2,
         size: int = 1000
     ) -> List[Dict[str, Any]]:
-        """Get the most recent articles in the time window, newest first.
-
-        Without an explicit sort, ES returns hits in an unspecified (roughly
-        index/insertion) order, so a capped `size` would silently drop newer
-        articles once the window contains more docs than `size`. Sorting
-        descending on published_at guarantees "recent" actually means recent.
-        """
+        """Get the most recent articles in the time window, newest first."""
         if not self.client:
             raise RuntimeError("Elasticsearch not connected")
 
@@ -516,13 +511,7 @@ class ElasticsearchClient:
         hours: int = 24,
         hours_before: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Get sentiment history for an entity.
-
-        By default returns the window from `hours` ago to now. Pass
-        `hours_before` to instead get a bounded window ending `hours_before`
-        hours ago (e.g. hours=24, hours_before=24 -> the 24-48h-ago window),
-        so a "prior period" comparison doesn't overlap with "current period".
-        """
+        """Get sentiment history for an entity."""
         if not self.client:
             raise RuntimeError("Elasticsearch not connected")
 
