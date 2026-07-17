@@ -1,6 +1,6 @@
 """Search API Router.
 
-Handles hybrid search, semantic search, and keyword search endpoints using native DNS resolution.
+Handles hybrid search, semantic search, and keyword search endpoints using DNS-over-HTTPS bypass.
 """
 
 from fastapi import APIRouter, Query, HTTPException
@@ -9,6 +9,7 @@ from pydantic import BaseModel
 import asyncio
 import urllib.request
 import json
+import ssl
 import structlog
 
 from app.utils.elasticsearch_client import es_client
@@ -35,42 +36,63 @@ class SearchResponse(BaseModel):
     used_reranking: bool
 
 
-def get_query_embedding_native(query: str) -> List[float]:
-    """Fetch query embedding using Python's native urllib (immune to httpx DNS bugs)."""
-    # Try the main endpoint, fallback to CDN if needed
-    urls = [
-        "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
-        "https://api.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
-    ]
+def resolve_dns_via_cloudflare(hostname: str) -> str:
+    """Fetch the IP address of a hostname directly from Cloudflare DoH (bypasses DNS entirely)."""
+    # Cloudflare's secure DNS resolver IP
+    url = f"https://1.1.1.1/dns-query?name={hostname}&type=A"
+    req = urllib.request.Request(url, headers={"Accept": "application/dns-json"})
     
-    last_error = None
-    for url in urls:
-        try:
-            data = json.dumps({"inputs": query}).encode("utf-8")
-            req = urllib.request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            # Use native OS-level blocking DNS resolution
-            with urllib.request.urlopen(req, timeout=8.0) as response:
-                if response.status == 200:
-                    result = json.loads(response.read().decode("utf-8"))
-                    
-                    # Auto-flatten nested lists (e.g. [[[...]]] or [[...]] -> [...])
-                    if isinstance(result, list) and len(result) > 0:
-                        while isinstance(result[0], list):
-                            result = result[0]
-                        return result
-                    raise ValueError("Unexpected API response format")
-                else:
-                    last_error = f"Status {response.status}"
-        except Exception as e:
-            logger.warning("native_endpoint_failed", url=url, error=str(e))
-            last_error = str(e)
+    # Disable SSL hostname check for 1.1.1.1 lookup
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    
+    with urllib.request.urlopen(req, context=ctx, timeout=5.0) as response:
+        data = json.loads(response.read().decode("utf-8"))
+        for answer in data.get("Answer", []):
+            if answer.get("type") == 1:  # A record (IPv4)
+                return answer["data"]
+    raise RuntimeError(f"Cloudflare DoH failed to resolve IP for {hostname}")
+
+
+def get_query_embedding_via_ip(query: str) -> List[float]:
+    """Fetch query embedding directly using Hugging Face's resolved IP address."""
+    hostname = "api-inference.huggingface.co"
+    
+    # Bypasses Render's broken DNS lookup by getting the IP from Cloudflare
+    ip_address = resolve_dns_via_cloudflare(hostname)
+    
+    # Construct URL using the raw IP
+    url = f"https://{ip_address}/models/sentence-transformers/all-MiniLM-L6-v2"
+    data = json.dumps({"inputs": query}).encode("utf-8")
+    
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Host": hostname  # Important: Cloudflare requires the original hostname in headers
+        },
+        method="POST"
+    )
+    
+    # Disable SSL verification since we are connecting directly to an IP address
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    
+    with urllib.request.urlopen(req, context=ctx, timeout=10.0) as response:
+        if response.status == 200:
+            result = json.loads(response.read().decode("utf-8"))
             
-    raise RuntimeError(f"All native endpoints failed: {last_error}")
+            # Auto-flatten nested lists (e.g. [[[...]]] or [[...]] -> [...])
+            if isinstance(result, list) and len(result) > 0:
+                while isinstance(result[0], list):
+                    result = result[0]
+                return result
+            raise ValueError("Unexpected API response format")
+            
+    raise RuntimeError("Hugging Face API request failed over IP connection")
 
 
 @router.post("", response_model=SearchResponse)
@@ -83,11 +105,11 @@ async def hybrid_search(request: SearchRequest):
         raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
 
     try:
-        # Run the native blocking DNS request on a background thread (bypasses anyio bug)
-        query_embedding = await asyncio.to_thread(get_query_embedding_native, request.query)
+        # Resolve and connect to HF completely bypassing system DNS
+        query_embedding = await asyncio.to_thread(get_query_embedding_via_ip, request.query)
     except Exception as e:
-        logger.error("native_dns_resolution_failed", error=str(e))
-        raise HTTPException(status_code=502, detail="Failed to generate search embedding via native resolver")
+        logger.error("dns_bypass_resolution_failed", error=str(e))
+        raise HTTPException(status_code=502, detail="Failed to generate search embedding via DNS-bypass resolver")
 
     # Perform hybrid search with RRF on Elastic Serverless
     results = await es_client.hybrid_search_rrf(
@@ -164,10 +186,10 @@ async def semantic_search(
     start_time = time.time()
 
     try:
-        query_embedding = await asyncio.to_thread(get_query_embedding_native, query)
+        query_embedding = await asyncio.to_thread(get_query_embedding_via_ip, query)
     except Exception as e:
-        logger.error("native_dns_resolution_failed", error=str(e))
-        raise HTTPException(status_code=502, detail="Failed to generate search embedding via native resolver")
+        logger.error("dns_bypass_resolution_failed", error=str(e))
+        raise HTTPException(status_code=502, detail="Failed to generate search embedding via DNS-bypass resolver")
 
     filters = {}
     if source:
