@@ -200,21 +200,45 @@ class SupabaseDBClient:
         limit: int = 20,
         offset: int = 0
     ) -> List[Dict[str, Any]]:
-        """Get articles mentioning an entity."""
-        # Get article IDs for this entity
+        """Get the most recent articles mentioning an entity.
+
+        Uses a case-insensitive match: entity_name here often comes from an
+        LLM re-extracting a name from a free-text query (e.g. "trump" or
+        "Donald Trump"), not the exact casing/form spaCy's NER originally
+        tagged and stored - an exact match would silently return nothing on
+        any casing mismatch and fall through to a much noisier BM25 search.
+
+        IMPORTANT: article_entities has no timestamp of its own, so we can't
+        order/limit at that level and expect recency. The old version did
+        `.limit(limit)` directly on article_entities with no order() at all,
+        which returns whichever `limit` matching rows Postgres happens to
+        return first (effectively insertion order) - meaning the same old
+        article could stay "in the top 3" forever regardless of what's
+        ingested afterward. Instead, pull a much larger candidate pool of
+        article_ids, fetch their real published_at via the articles table,
+        sort by that, and only then truncate to `limit`.
+        """
+        # Pull a generous candidate pool of matching article_ids - offset
+        # only applies within this pool, so widen it enough that recent
+        # mentions aren't excluded by an early, arbitrary cutoff.
+        candidate_pool = max(limit * 20, 200)
+
         entities_result = self.client.table("article_entities").select(
             "article_id"
-        ).eq("entity_text", entity_name).limit(limit).offset(offset).execute()
+        ).ilike("entity_text", entity_name).limit(candidate_pool).execute()
 
-        article_ids = [e["article_id"] for e in entities_result.data]
+        article_ids = list({e["article_id"] for e in entities_result.data})
 
         if not article_ids:
             return []
 
-        # Get article details
+        # Get article details, sorted by actual recency, then apply the
+        # real limit/offset here where sorting has already happened.
         articles_result = self.client.table("articles").select(
             "article_id, title, source, published_at, sentiment_score, category"
-        ).in_("article_id", article_ids).order("published_at", desc=True).execute()
+        ).in_("article_id", article_ids).order(
+            "published_at", desc=True
+        ).range(offset, offset + limit - 1).execute()
 
         return articles_result.data
 

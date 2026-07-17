@@ -235,6 +235,28 @@ class RedisClient:
                     centroids[cluster_id] = centroid
         return centroids
 
+    async def flush_cluster_centroids(self) -> int:
+        """Delete all cached cluster centroids.
+
+        Emergence detection treats any cluster whose centroid is already
+        cached (up to 48h) as 'already seen' and suppresses it, even if it
+        was never actually surfaced in the feed. This is correct behavior in
+        steady state, but during dev/testing - repeatedly hitting
+        /intelligence/feed/generate against a static or slow-growing corpus -
+        it makes real emerging topics vanish after the first generation.
+        This clears that cache so the next detection run treats everything
+        as new again. Returns the number of keys deleted.
+        """
+        if not self.client:
+            raise RuntimeError("Redis not connected")
+
+        keys = await self.client.keys("cluster:*:centroid")
+        if not keys:
+            return 0
+
+        await self.client.delete(*keys)
+        return len(keys)
+
 
 # Global Redis client instance
 redis_client = RedisClient()

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 import hashlib
+import re
 import structlog
 
 from app.config import settings
@@ -31,6 +32,28 @@ RSS_FEEDS = [
     {"name": "Wired", "url": "https://www.wired.com/feed/rss", "category": "technology"},
     {"name": "Euronews", "url": "https://www.euronews.com/rss", "category": "europe"},
 ]
+
+# Titles matching these patterns aren't news articles - they're recurring
+# template/index pages (TV bulletin landing pages, programme grids, live
+# blogs re-published each edition). Their "content" is mostly boilerplate
+# (show names, section headers), which pollutes NER/keyphrase extraction
+# and makes near-identical editions falsely cluster as an "emerging topic"
+# in DBSCAN since their embeddings are almost identical to each other.
+NON_ARTICLE_TITLE_PATTERNS = [
+    r"^latest news bulletin\b",
+    r"\bmorning bulletin\b",
+    r"\bevening bulletin\b",
+    r"^live:?\s",
+    r"\bliveblog\b",
+]
+
+
+def _looks_like_non_article(title: str) -> bool:
+    """Heuristic filter for template/digest pages that aren't real articles."""
+    if not title:
+        return False
+    title_lower = title.lower()
+    return any(re.search(pattern, title_lower) for pattern in NON_ARTICLE_TITLE_PATTERNS)
 
 
 class NewsFetcher:
@@ -136,6 +159,12 @@ class NewsFetcher:
 
         # Extract content
         title = entry.get("title", "")
+
+        if _looks_like_non_article(title):
+            self.stats["skipped"] += 1
+            logger.debug("skipped_non_article", title=title[:60])
+            return
+
         published = entry.get("published_parsed") or entry.get("updated_parsed")
 
         if published:
@@ -145,6 +174,17 @@ class NewsFetcher:
 
         # Fetch full article content
         body = await self._extract_content(url)
+
+        # trafilatura fails silently on paywalled, bot-blocked, or JS-rendered
+        # pages (returns ""). RSS entries almost always carry a summary/
+        # description too - falling back to that keeps the article alive
+        # instead of it silently dying at the nlp_worker's short-text skip.
+        if not body:
+            summary = entry.get("summary") or entry.get("description") or ""
+            if summary:
+                # RSS summaries are sometimes HTML - strip tags for plain text
+                import re as _re
+                body = _re.sub(r"<[^>]+>", " ", summary).strip()
 
         # Generate unique ID
         article_id = hashlib.sha256(url.encode()).hexdigest()[:36]

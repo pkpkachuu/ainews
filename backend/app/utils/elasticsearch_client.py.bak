@@ -104,16 +104,7 @@ class ElasticsearchClient:
         """Initialize Elasticsearch connection."""
         self.client = AsyncElasticsearch(
             [settings.elasticsearch_url],
-            verify_certs=False,
-            # Narrative monitoring fires ~3 ES calls per tracked entity
-            # concurrently across up to 20 entities - default pool size (~10)
-            # and default request_timeout were causing queued requests to
-            # time out under that load, especially on a single local ES node
-            # sharing the machine with spaCy/embedding model processes.
-            max_retries=2,
-            retry_on_timeout=True,
-            request_timeout=30,
-            connections_per_node=25
+            verify_certs=False
         )
         logger.info("elasticsearch_connected", url=settings.elasticsearch_url)
 
@@ -478,13 +469,7 @@ class ElasticsearchClient:
         hours: int = 2,
         size: int = 1000
     ) -> List[Dict[str, Any]]:
-        """Get the most recent articles in the time window, newest first.
-
-        Without an explicit sort, ES returns hits in an unspecified (roughly
-        index/insertion) order, so a capped `size` would silently drop newer
-        articles once the window contains more docs than `size`. Sorting
-        descending on published_at guarantees "recent" actually means recent.
-        """
+        """Get articles from recent time window."""
         if not self.client:
             raise RuntimeError("Elasticsearch not connected")
 
@@ -496,9 +481,6 @@ class ElasticsearchClient:
                     }
                 }
             },
-            "sort": [
-                {"published_at": {"order": "desc"}}
-            ],
             "size": size,
             "_source": ["article_id", "title", "body", "embedding", "entities", "keyphrases", "published_at", "source", "sentiment_score"]
         }
@@ -513,25 +495,11 @@ class ElasticsearchClient:
     async def get_entity_sentiment_history(
         self,
         entity: str,
-        hours: int = 24,
-        hours_before: Optional[int] = None
+        hours: int = 24
     ) -> Dict[str, Any]:
-        """Get sentiment history for an entity.
-
-        By default returns the window from `hours` ago to now. Pass
-        `hours_before` to instead get a bounded window ending `hours_before`
-        hours ago (e.g. hours=24, hours_before=24 -> the 24-48h-ago window),
-        so a "prior period" comparison doesn't overlap with "current period".
-        """
+        """Get sentiment history for an entity."""
         if not self.client:
             raise RuntimeError("Elasticsearch not connected")
-
-        published_range: Dict[str, str] = {"gte": f"now-{hours}h"}
-        if hours_before is not None:
-            published_range = {
-                "gte": f"now-{hours + hours_before}h",
-                "lt": f"now-{hours_before}h"
-            }
 
         search_body = {
             "query": {
@@ -545,7 +513,7 @@ class ElasticsearchClient:
                         },
                         {
                             "range": {
-                                "published_at": published_range
+                                "published_at": {"gte": f"now-{hours}h"}
                             }
                         }
                     ]

@@ -132,11 +132,8 @@ class NLPProcessor:
             # Extract text for processing
             text = self._prepare_text(msg_data)
 
-            if len(text) < 40:
-                # Skip only genuinely empty/near-empty entries (e.g. title
-                # missing too). 100 was killing title-only articles whenever
-                # trafilatura/RSS-summary extraction failed - title alone is
-                # still usable for entities, embedding, and sentiment.
+            if len(text) < 100:
+                # Skip very short articles
                 await db_client.mark_article_failed(article_id, "Article too short")
                 self.stats["failed"] += 1
                 return
@@ -193,15 +190,12 @@ class NLPProcessor:
 
             await es_client.index_article(article_doc)
 
-            # Acknowledge message - only meaningful for real stream reads.
-            # "manual" is used for direct/backfill calls (e.g. /ingest/process)
-            # that bypass the Redis stream entirely, so there's nothing to ack.
-            if msg_id != "manual":
-                await redis_client.ack_message(
-                    self.stream_key,
-                    self.group_name,
-                    msg_id
-                )
+            # Acknowledge message
+            await redis_client.ack_message(
+                self.stream_key,
+                self.group_name,
+                msg_id
+            )
 
             self.stats["processed"] += 1
 
@@ -219,21 +213,20 @@ class NLPProcessor:
                 error=str(e)
             )
 
-            if msg_id != "manual":
-                # Add to dead letter queue
-                await redis_client.add_to_dlq(
-                    self.stream_key,
-                    msg_id,
-                    msg_data,
-                    str(e)
-                )
+            # Add to dead letter queue
+            await redis_client.add_to_dlq(
+                self.stream_key,
+                msg_id,
+                msg_data,
+                str(e)
+            )
 
-                # Acknowledge to avoid reprocessing
-                await redis_client.ack_message(
-                    self.stream_key,
-                    self.group_name,
-                    msg_id
-                )
+            # Acknowledge to avoid reprocessing
+            await redis_client.ack_message(
+                self.stream_key,
+                self.group_name,
+                msg_id
+            )
 
             self.stats["failed"] += 1
 

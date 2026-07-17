@@ -115,60 +115,6 @@ async def root():
     }
 
 
-@app.post("/admin/purge-non-articles")
-async def purge_non_articles():
-    """Dev/testing utility: remove already-ingested non-article pages.
-
-    The fetcher now filters these out going forward (see
-    NON_ARTICLE_TITLE_PATTERNS in fetcher.py), but articles ingested before
-    that filter existed - e.g. Euronews bulletin/programme-grid pages - are
-    still sitting in ES and can still form false 'emerging' clusters since
-    their boilerplate text embeds as near-identical across editions. This
-    finds and deletes matches from Elasticsearch so they drop out of future
-    clustering. Does not touch Postgres/Supabase rows.
-    """
-    from app.services.fetcher import _looks_like_non_article
-
-    result = await es_client.client.search(
-        index="articles",
-        body={"query": {"match_all": {}}, "_source": ["article_id", "title"], "size": 1000}
-    )
-
-    to_delete = [
-        hit["_source"]["article_id"]
-        for hit in result["hits"]["hits"]
-        if _looks_like_non_article(hit["_source"].get("title", ""))
-    ]
-
-    for article_id in to_delete:
-        await es_client.delete_article(article_id)
-
-    return {
-        "message": "Purged non-article pages from Elasticsearch",
-        "deleted_count": len(to_delete),
-        "deleted_ids": to_delete
-    }
-
-
-@app.post("/admin/reset-clusters")
-async def reset_clusters():
-    """Dev/testing utility: clear the emergence detector's centroid cache.
-
-    Emergence detection suppresses any cluster whose centroid is already
-    cached (48h TTL) as 'already seen', regardless of whether it ever made
-    it into the feed. That's correct in steady state but means repeatedly
-    hitting /intelligence/feed/generate against the same static corpus makes
-    real emerging topics disappear after the first generation. This clears
-    the cache so the next run treats current clusters as new again.
-    """
-    deleted = await redis_client.flush_cluster_centroids()
-
-    return {
-        "message": "Cluster centroid cache cleared",
-        "centroids_deleted": deleted
-    }
-
-
 # Manual ingestion endpoints
 @app.post("/ingest/fetch")
 async def trigger_fetch():
@@ -189,45 +135,19 @@ async def trigger_fetch():
 async def trigger_processing():
     """Manually trigger processing of pending articles.
 
-    Runs pending articles through the NLP pipeline (entities, sentiment,
-    keyphrases, embedding) and indexes them to Elasticsearch, synchronously,
-    so a single call is enough to make new articles searchable and eligible
-    for emergence detection.
+    Processes pending articles through NLP pipeline.
     """
-    from app.workers.nlp_worker import NLPProcessor
-
-    pending = await db_client.get_pending_articles(limit=50)
+    pending = await db_client.get_pending_articles(limit=10)
 
     if not pending:
-        return {
-            "message": "No pending articles to process",
-            "processed_count": 0,
-            "failed_count": 0
-        }
+        return {"message": "No pending articles to process"}
 
-    processor = NLPProcessor(consumer_name="manual-trigger")
-    processed_count = 0
-    failed_count = 0
-
-    for article in pending:
-        try:
-            await processor._process_message(msg_id="manual", msg_data=article)
-            processed_count += 1
-        except Exception as e:
-            logger.error(
-                "manual_processing_failed",
-                article_id=article.get("article_id"),
-                error=str(e)
-            )
-            failed_count += 1
-
-    remaining = await db_client.get_pending_articles(limit=100)
-
+    # Note: In production, this would spawn workers
+    # For now, it just returns pending article count
     return {
-        "message": "Processing completed",
-        "processed_count": processed_count,
-        "failed_count": failed_count,
-        "remaining_pending": len(remaining)
+        "message": "Found pending articles",
+        "count": len(pending),
+        "article_ids": [a["article_id"] for a in pending]
     }
 
 

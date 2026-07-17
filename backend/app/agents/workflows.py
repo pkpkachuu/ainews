@@ -87,14 +87,25 @@ async def extract_entity(state: TimelineState) -> TimelineState:
 async def retrieve_timeline_articles(state: TimelineState) -> TimelineState:
     """Retrieve articles for timeline, ordered chronologically."""
     entity = state.get("entity_or_topic", state["query"])
+    entity_lower = entity.lower()
 
     # Get articles from database
-    articles = await db_client.get_articles_by_entity(entity, limit=50)
+    articles = await db_client.get_articles_by_entity(entity, limit=100)
 
     if not articles:
-        # Try keyword search
-        results = await es_client.search_bm25(entity, size=50)
-        articles = results
+        # Fall back to keyword search
+        articles = await es_client.search_bm25(entity, size=100)
+
+    # NER tags any mention of the entity anywhere in the body - including a
+    # throwaway "see also our Apple deals" cross-link at the bottom of an
+    # unrelated roundup/deals article - so entity-tagged articles aren't
+    # automatically "about" that entity. Require it appear in the title so
+    # a timeline only includes articles genuinely centered on the subject.
+    title_matches = [
+        a for a in articles
+        if entity_lower in (a.get("title", "") or "").lower()
+    ]
+    articles = title_matches[:50] if title_matches else articles[:50]
 
     # Sort by published_at
     articles.sort(key=lambda x: x.get("published_at", "") or "")
@@ -154,9 +165,23 @@ async def synthesize_timeline(state: TimelineState) -> TimelineState:
     if model and len(timeline) > 0:
         try:
             # Build context
+            # Feed the full span, not just the most recent buckets - truncating
+            # to the tail biases the narrative toward whatever happened most
+            # recently instead of genuinely summarizing the whole arc. If the
+            # timeline is very long, sample across it rather than just cutting
+            # off the earlier half.
+            MAX_BUCKETS_FOR_CONTEXT = 20
+            if len(timeline) <= MAX_BUCKETS_FOR_CONTEXT:
+                context_buckets = timeline
+            else:
+                step = len(timeline) / MAX_BUCKETS_FOR_CONTEXT
+                context_buckets = [
+                    timeline[int(i * step)] for i in range(MAX_BUCKETS_FOR_CONTEXT)
+                ]
+
             context = "\n".join([
                 f"{t['date']}: {len(t['headline_titles'])} articles - {', '.join(t['headline_titles'][:2])}"
-                for t in timeline[-10:]  # Last 10 events
+                for t in context_buckets
             ])
 
             response = model.chat.completions.create(
@@ -258,14 +283,24 @@ async def fetch_trend_data(state: TrendExplanationState) -> TrendExplanationStat
 async def retrieve_supporting_articles(state: TrendExplanationState) -> TrendExplanationState:
     """Retrieve articles to support explanation."""
     topic = state.get("entity_or_topic", "")
+    topic_lower = topic.lower()
     trend = state.get("trend_data", {})
 
     # Get recent articles for the topic
-    articles = await db_client.get_articles_by_entity(topic, limit=10)
+    articles = await db_client.get_articles_by_entity(topic, limit=30)
 
     if not articles:
         # Fallback to keyword search
-        articles = await es_client.search_bm25(topic, size=10)
+        articles = await es_client.search_bm25(topic, size=30)
+
+    # Same reasoning as the timeline workflow: entity-tagging doesn't mean
+    # centrality, so require the topic actually appear in the title before
+    # presenting an article as "supporting evidence" for an explanation.
+    title_matches = [
+        a for a in articles
+        if topic_lower in (a.get("title", "") or "").lower()
+    ]
+    articles = title_matches[:10] if title_matches else articles[:10]
 
     return {**state, "retrieved_articles": articles, "turns": state["turns"] + 1}
 

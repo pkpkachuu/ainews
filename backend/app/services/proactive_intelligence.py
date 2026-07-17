@@ -6,6 +6,7 @@ Core component that generates intelligence without user queries:
 - Feed Generator: Creates intelligence feed twice daily
 """
 
+import asyncio
 import json
 import numpy as np
 from datetime import datetime, timezone, timedelta
@@ -45,7 +46,7 @@ class EmergenceDetector:
     """Detects emerging topic clusters not seen in prior 48 hours."""
 
     def __init__(self):
-        self.min_articles = 5
+        self.min_articles = settings.emergence_min_articles
         self.similarity_threshold = 0.85
 
     async def detect(self) -> List[Dict[str, Any]]:
@@ -54,10 +55,18 @@ class EmergenceDetector:
         Returns:
             List of emerging topic candidates
         """
-        logger.info("emergence_detection_starting")
+        logger.info("emergence_detection_starting", window_hours=settings.emergence_window_hours)
 
-        # Get articles from last 2 hours
-        recent_articles = await es_client.get_recent_articles(hours=720, size=500)  # widened for dev/testing backlog data
+        # Window is configurable (settings.emergence_window_hours). Keep this
+        # tight (2h) in production - widening it permanently turns "emergence"
+        # into a repeated re-scan of the same backlog, and since cluster
+        # centroids only live in Redis for 48h (CANDIDATES_TTL) while a wide
+        # window can span weeks, old clusters would resurface as "new" every
+        # time their centroid entry expires. Widen only via .env for dev.
+        recent_articles = await es_client.get_recent_articles(
+            hours=settings.emergence_window_hours,
+            size=settings.emergence_max_articles
+        )
 
         if len(recent_articles) < self.min_articles:
             logger.info("emergence_insufficient_articles", count=len(recent_articles))
@@ -204,6 +213,8 @@ class EmergenceDetector:
 
         first_seen = min(timestamps) if timestamps else datetime.now(timezone.utc).isoformat()
 
+        article_ids = [a["article_id"] for a in articles if a.get("article_id")]
+
         return {
             "type": "EMERGING_TOPIC",
             "cluster_id": f"clust_{datetime.now().strftime('%Y%m%d_%H%M')}_{cluster_id}",
@@ -211,6 +222,7 @@ class EmergenceDetector:
             "article_count": len(articles),
             "key_entities": top_entities,
             "keyphrases": top_phrases,
+            "supporting_articles": article_ids,
             "first_article_at": first_seen,
             "centroid_embedding": centroid,
             "detected_at": datetime.now(timezone.utc).isoformat(),
@@ -225,7 +237,7 @@ class NarrativeMonitor:
         self.sentiment_shift_threshold = 0.3
         self.sentiment_reversal_threshold = 0.5
         self.divergence_threshold = 0.4
-        self.min_articles = 10
+        self.min_articles = settings.narrative_min_articles
 
     async def monitor(self) -> List[Dict[str, Any]]:
         """Run narrative monitoring for tracked entities.
@@ -243,12 +255,33 @@ class NarrativeMonitor:
             await self._auto_track_entities()
             tracked = await db_client.get_tracked_entities(active_only=True)
 
-        narrative_shifts = []
+        # Check entity sentiment with bounded concurrency - unbounded gather
+        # here was firing ~3 ES requests per entity simultaneously across all
+        # tracked entities (up to 60+ concurrent requests), which saturates a
+        # local single-node ES's connection pool and causes queued requests
+        # to time out instead of just running a bit slower.
+        semaphore = asyncio.Semaphore(5)
 
-        for entity in tracked:
-            shift = await self._check_entity_sentiment(entity)
-            if shift:
-                narrative_shifts.append(shift)
+        async def _check_with_limit(entity):
+            async with semaphore:
+                return await self._check_entity_sentiment(entity)
+
+        results = await asyncio.gather(
+            *(_check_with_limit(entity) for entity in tracked),
+            return_exceptions=True
+        )
+
+        narrative_shifts = []
+        for entity, result in zip(tracked, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "entity_sentiment_check_failed",
+                    entity=entity.get("entity_name"),
+                    error=str(result)
+                )
+                continue
+            if result:
+                narrative_shifts.append(result)
 
         logger.info(
             "narrative_monitor_complete",
@@ -307,12 +340,11 @@ class NarrativeMonitor:
         """Check sentiment shift for a single entity."""
         entity_name = entity["entity_name"]
 
-        # Get sentiment for current 24h window
+        # Current window: last 24h. Prior window: the 24h before that
+        # (24-48h ago) - non-overlapping, so this is an actual before/after
+        # comparison instead of comparing against a fake neutral baseline.
         current = await es_client.get_entity_sentiment_history(entity_name, hours=24)
-        prior = await es_client.get_entity_sentiment_history(entity_name, hours=48)
-
-        # Calculate prior window sentiment (24-48h ago)
-        # Note: This is simplified - proper implementation would query specific date ranges
+        prior = await es_client.get_entity_sentiment_history(entity_name, hours=24, hours_before=24)
 
         current_sentiment = current.get("avg_sentiment")
         if current_sentiment is None:
@@ -343,9 +375,11 @@ class NarrativeMonitor:
         if article_count < self.min_articles:
             return None
 
-        # Get prior period sentiment (approximate by extending window)
-        # For MVP, compare current to a baseline of 0 (neutral)
-        prior_sentiment = 0.0  # Would need proper date range queries
+        # If there's no prior-period coverage at all, there's nothing to
+        # compare against - a first appearance isn't a "shift".
+        prior_sentiment = prior.get("avg_sentiment")
+        if prior_sentiment is None:
+            return None
 
         delta = current_sentiment - prior_sentiment
 
@@ -389,6 +423,7 @@ class FeedGenerator:
 
     def __init__(self):
         self.max_feed_items = 15
+        self.min_feed_items = 5  # floor - backfill with top recent articles if real signal is thin
 
     async def generate(self) -> List[Dict[str, Any]]:
         """Generate intelligence feed from candidates.
@@ -402,14 +437,19 @@ class FeedGenerator:
         candidates_raw = await redis_client.lrange(INTELLIGENCE_CANDIDATES_KEY, 0, -1)
 
         if not candidates_raw:
-            logger.info("feed_no_candidates")
+            # Previously this returned early and left whatever feed was
+            # already in Redis untouched - which looked like a successful,
+            # up-to-date generation even when nothing had actually changed.
+            # Log loudly so a stalled detector is visible instead of silent,
+            # and report explicitly that nothing was updated this cycle.
+            existing_feed_len = await redis_client.llen(INTELLIGENCE_FEED_KEY)
+            logger.warning(
+                "feed_no_candidates_feed_unchanged",
+                existing_feed_items=existing_feed_len
+            )
             return []
 
         candidates = list(candidates_raw)
-
-        # Consume the candidates now that we've read them - otherwise they
-        # accumulate forever and get re-scored in every future generation cycle
-        await redis_client.delete(INTELLIGENCE_CANDIDATES_KEY)
 
         # Consume the candidates now that we've read them - otherwise they
         # accumulate forever and get re-scored in every future generation cycle
@@ -428,15 +468,49 @@ class FeedGenerator:
         # Sort by score
         scored_candidates.sort(key=lambda x: x["combined_score"], reverse=True)
 
+        # Backfill with recent top articles when clustering/narrative signal
+        # is too thin to hit the floor - these are lower-confidence "TOP_STORY"
+        # items, not real detected signal, and are always ranked below any
+        # genuine EMERGING_TOPIC/NARRATIVE_SHIFT candidate.
+        if len(scored_candidates) < self.min_feed_items:
+            needed = self.min_feed_items - len(scored_candidates)
+            existing_article_ids = {
+                aid
+                for c in scored_candidates
+                for aid in c.get("supporting_articles", [])
+            }
+            backfill = await self._get_backfill_candidates(needed, existing_article_ids)
+            scored_candidates.extend(backfill)
+
         # Take top items
         top_items = scored_candidates[:self.max_feed_items]
 
-        # Generate summaries with LLM
+        # Generate summaries concurrently instead of one item at a time - each
+        # item does a DB fetch plus a Groq API round trip, so this was the
+        # other major sequential bottleneck. Capped at 5 concurrent so we
+        # don't trip Groq's rate limits when there are many top items.
+        semaphore = asyncio.Semaphore(5)
+
+        async def _create_with_limit(item, index):
+            async with semaphore:
+                return await self._create_feed_item(item, index)
+
+        results = await asyncio.gather(
+            *(_create_with_limit(item, i) for i, item in enumerate(top_items)),
+            return_exceptions=True
+        )
+
         feed_items = []
-        for i, item in enumerate(top_items):
-            feed_item = await self._create_feed_item(item, i)
-            if feed_item:
-                feed_items.append(feed_item)
+        for item, result in zip(top_items, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "feed_item_generation_failed",
+                    candidate_label=item.get("candidate_label") or item.get("entity"),
+                    error=str(result)
+                )
+                continue
+            if result:
+                feed_items.append(result)
 
         # Write to feed
         await self._write_feed(feed_items)
@@ -445,34 +519,99 @@ class FeedGenerator:
 
         return feed_items
 
+    async def _get_backfill_candidates(
+        self,
+        needed: int,
+        exclude_article_ids: set
+    ) -> List[Dict[str, Any]]:
+        """Pull recent articles to pad the feed when real signal is thin.
+
+        These are explicitly weaker than detected signal: combined_score is
+        capped below the minimum score a real EMERGING_TOPIC/NARRATIVE_SHIFT
+        candidate can get, so they only fill remaining slots and never
+        outrank genuine detections.
+        """
+        try:
+            recent = await es_client.get_recent_articles(hours=48, size=needed * 3)
+        except Exception as e:
+            logger.warning("backfill_fetch_failed", error=str(e))
+            return []
+
+        backfill = []
+        for article in recent:
+            aid = article.get("article_id")
+            if not aid or aid in exclude_article_ids:
+                continue
+
+            backfill.append({
+                "type": "TOP_STORY",
+                "candidate_label": article.get("title", "")[:80],
+                "article_count": 1,
+                "key_entities": [e.get("text") for e in (article.get("entities") or [])[:5] if isinstance(e, dict)],
+                "supporting_articles": [aid],
+                "detected_at": article.get("published_at") or datetime.now(timezone.utc).isoformat(),
+                "combined_score": 0.05,  # floor score - always below real signal
+            })
+
+            if len(backfill) >= needed:
+                break
+
+        return backfill
+
     def _deduplicate_candidates(
         self,
         candidates: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Merge candidates with overlapping entities."""
+        """Merge true duplicates only.
+
+        DBSCAN already partitions articles into non-overlapping clusters, so
+        two EMERGING_TOPIC candidates are distinct stories by construction -
+        even if they happen to share one common entity mention (e.g. two
+        unrelated stories both mentioning "US" or "Trump"). Merging those on
+        a shared first-entity key was silently discarding real, distinct
+        stories down to one. The only legitimate merge is a NARRATIVE_SHIFT
+        being folded into an EMERGING_TOPIC that's tracking the same entity,
+        since those come from two different detectors describing one event.
+        """
         if len(candidates) <= 1:
             return candidates
 
-        merged = []
-        seen_entities = {}
+        emerging = [c for c in candidates if c["type"] == "EMERGING_TOPIC"]
+        shifts = [c for c in candidates if c["type"] == "NARRATIVE_SHIFT"]
 
-        for candidate in candidates:
-            # Key by main entity/topic
-            if candidate["type"] == "NARRATIVE_SHIFT":
-                key = candidate.get("entity", "")
-            else:
-                entities = candidate.get("key_entities", [])
-                key = entities[0] if entities else candidate.get("candidate_label", "")
+        emerging_entity_sets = [set(c.get("key_entities", [])) for c in emerging]
 
-            if key in seen_entities:
-                # Merge with existing
-                existing_idx = seen_entities[key]
-                merged[existing_idx]["article_count"] += candidate.get("article_count", 0)
-            else:
-                seen_entities[key] = len(merged)
-                merged.append(candidate)
+        remaining_shifts: List[Dict[str, Any]] = []
+        for shift in shifts:
+            entity = shift.get("entity", "")
+            shift_articles = set(shift.get("supporting_articles", []))
+            absorbed = False
 
-        return merged
+            # First: fold into a matching EMERGING_TOPIC on the same entity.
+            for idx, entity_set in enumerate(emerging_entity_sets):
+                if entity and entity in entity_set:
+                    emerging[idx]["article_count"] += shift.get("article_count", 1)
+                    absorbed = True
+                    break
+
+            if absorbed:
+                continue
+
+            # Second: fold into an already-kept shift if they reference the
+            # same underlying articles - this catches near-duplicate tracked
+            # entity names (e.g. "Trump" vs "Donald Trump") that are really
+            # the same story, without needing exact string equality.
+            for kept in remaining_shifts:
+                kept_articles = set(kept.get("supporting_articles", []))
+                if shift_articles and kept_articles and (shift_articles & kept_articles):
+                    kept["article_count"] = kept.get("article_count", 1) + shift.get("article_count", 1)
+                    absorbed = True
+                    break
+
+            if not absorbed:
+                remaining_shifts.append(shift)
+
+        return emerging + remaining_shifts
 
     def _calculate_score(self, candidate: Dict[str, Any]) -> float:
         """Calculate combined score for ranking."""
@@ -703,7 +842,11 @@ Start with the most important development. Do not speculate."""
     def _get_trigger_reason(self, candidate: Dict[str, Any]) -> str:
         """Get human-readable trigger reason."""
         if candidate["type"] == "EMERGING_TOPIC":
-            return f"{candidate.get('article_count', 0)} new articles in 2h; no prior cluster match"
+            window = settings.emergence_window_hours
+            window_label = f"{window}h" if window < 48 else f"{window // 24}d"
+            return f"{candidate.get('article_count', 0)} new articles in {window_label}; no prior cluster match"
+        elif candidate["type"] == "TOP_STORY":
+            return "Recent coverage - no cluster or sentiment shift detected yet"
         else:
             return f"Sentiment {candidate.get('shift_type', 'shift').replace('_', ' ').lower()} of {abs(candidate.get('delta', 0)):.2f}"
 
@@ -748,7 +891,17 @@ class ProactiveIntelligenceEngine:
         return shifts
 
     async def generate_feed(self) -> List[Dict[str, Any]]:
-        """Generate and publish intelligence feed."""
+        """Generate and publish the intelligence feed.
+
+        Runs emergence detection and narrative monitoring first so this scans
+        for fresh signals every time it's called (scheduled or manual),
+        instead of only formatting whatever candidates happened to already be
+        queued in Redis from the last detection cycle.
+        """
+        logger.info("proactive_detection_cycle_starting")
+        await self.run_emergence_detection()
+        await self.run_narrative_monitoring()
+
         return await self.feed_generator.generate()
 
     async def get_feed(self) -> List[Dict[str, Any]]:

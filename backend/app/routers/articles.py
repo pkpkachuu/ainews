@@ -12,20 +12,6 @@ from app.utils.elasticsearch_client import es_client
 router = APIRouter(prefix="/articles", tags=["articles"])
 
 
-@router.get("/{article_id}")
-async def get_article(article_id: str) -> Dict[str, Any]:
-    """Get a single article by ID.
-
-    Returns article with entities and keyphrases.
-    """
-    article = await db_client.get_article(article_id)
-
-    if not article:
-        raise HTTPException(status_code=404, detail="Article not found")
-
-    return article
-
-
 @router.get("/")
 async def list_articles(
     source: Optional[str] = None,
@@ -136,6 +122,26 @@ async def get_article_stats() -> Dict[str, Any]:
         stats["es_error"] = str(e)
 
     return stats
+
+
+@router.get("/{article_id}")
+async def get_article(article_id: str) -> Dict[str, Any]:
+    """Get a single article by ID.
+
+    Returns article with entities and keyphrases.
+
+    NOTE: this route must stay registered AFTER the static /, /recent, and
+    /stats routes above - FastAPI matches routes in registration order, so
+    a dynamic /{article_id} defined first will greedily swallow requests to
+    /articles/stats and /articles/recent, treating "stats"/"recent" as an
+    article_id and blowing up with an invalid-UUID error at the DB layer.
+    """
+    article = await db_client.get_article(article_id)
+
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    return article
 
 
 @router.delete("/{article_id}")
