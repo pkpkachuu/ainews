@@ -14,7 +14,6 @@ async def sync_supabase_to_elasticsearch():
     logger.info("starting_bulk_reindex_from_supabase")
 
     try:
-        # Relational join: Fetch all articles, entities, and keyphrases in ONE single network request
         response = db_client.client.table("articles").select(
             "*, article_entities(entity_text, entity_type, confidence), article_keyphrases(keyphrase)"
         ).eq("processing_status", "done").execute()
@@ -24,7 +23,6 @@ async def sync_supabase_to_elasticsearch():
 
         es_articles = []
         for article in articles:
-            # Map Supabase relational join arrays to expected Elasticsearch format
             entities = [
                 {
                     "text": e["entity_text"],
@@ -53,7 +51,6 @@ async def sync_supabase_to_elasticsearch():
                 "indexed_at": article.get("indexed_at")
             }
 
-            # Safely parse embeddings if they exist
             embedding = article.get("embedding")
             if embedding:
                 if isinstance(embedding, str):
@@ -63,7 +60,7 @@ async def sync_supabase_to_elasticsearch():
 
             es_articles.append(article_doc)
 
-        # Bulk index to Elasticsearch in batches of 100 for safety and speed
+        # Bulk index to Elasticsearch in batches of 30 for safety and speed
         batch_size = 30
         for i in range(0, len(es_articles), batch_size):
             batch = es_articles[i : i + batch_size]
