@@ -35,7 +35,8 @@ class SearchResponse(BaseModel):
 
 async def get_query_embedding_from_api(query: str) -> List[float]:
     """Fetch query embedding from Hugging Face's free serverless Inference API."""
-    url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+    # Updated to the official Hugging Face model endpoint
+    url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
     headers = {}
     
     async with httpx.AsyncClient() as client:
@@ -48,8 +49,13 @@ async def get_query_embedding_from_api(query: str) -> List[float]:
             )
             if response.status_code == 200:
                 embedding = response.json()
+                
+                # Auto-flatten nested lists (e.g. [[[...]]] or [[...]] -> [...])
                 if isinstance(embedding, list) and len(embedding) > 0:
+                    while isinstance(embedding[0], list):
+                        embedding = embedding[0]
                     return embedding
+                
                 raise ValueError("Unexpected API response format")
             else:
                 logger.error("hf_api_error", status_code=response.status_code, text=response.text)
@@ -57,7 +63,6 @@ async def get_query_embedding_from_api(query: str) -> List[float]:
         except Exception as e:
             logger.error("hf_api_exception", error=str(e))
             raise HTTPException(status_code=502, detail="Embedding generation timed out or failed")
-
 
 @router.post("", response_model=SearchResponse)
 async def hybrid_search(request: SearchRequest):
