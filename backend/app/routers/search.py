@@ -1,6 +1,6 @@
 """Search API Router.
 
-Handles hybrid search, semantic search, and keyword search endpoints.
+Handles hybrid search, semantic search, and keyword search endpoints with DNS fallback routing.
 """
 
 from fastapi import APIRouter, Query, HTTPException
@@ -34,35 +34,42 @@ class SearchResponse(BaseModel):
 
 
 async def get_query_embedding_from_api(query: str) -> List[float]:
-    """Fetch query embedding from Hugging Face's free serverless Inference API."""
-    # Official Hugging Face model endpoint
-    url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
-    headers = {}
+    """Fetch query embedding from Hugging Face's serverless Inference API using DNS fallbacks."""
+    # Alternative DNS routes for Hugging Face serverless inference
+    endpoints = [
+        "https://api.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
+        "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
+        "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+    ]
     
+    last_error = None
     async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                url,
-                json={"inputs": query},
-                headers=headers,
-                timeout=10.0
-            )
-            if response.status_code == 200:
-                embedding = response.json()
+        for url in endpoints:
+            try:
+                response = await client.post(
+                    url,
+                    json={"inputs": query},
+                    timeout=10.0
+                )
+                if response.status_code == 200:
+                    embedding = response.json()
+                    
+                    # Auto-flatten nested lists (e.g. [[[...]]] or [[...]] -> [...])
+                    if isinstance(embedding, list) and len(embedding) > 0:
+                        while isinstance(embedding[0], list):
+                            embedding = embedding[0]
+                        return embedding
+                    
+                    raise ValueError("Unexpected API response format")
+                else:
+                    logger.warning("hf_endpoint_failed", url=url, status_code=response.status_code)
+                    last_error = f"Status {response.status_code}: {response.text}"
+            except Exception as e:
+                logger.warning("hf_endpoint_exception", url=url, error=str(e))
+                last_error = str(e)
                 
-                # Auto-flatten nested lists (e.g. [[[...]]] or [[...]] -> [...])
-                if isinstance(embedding, list) and len(embedding) > 0:
-                    while isinstance(embedding[0], list):
-                        embedding = embedding[0]
-                    return embedding
-                
-                raise ValueError("Unexpected API response format")
-            else:
-                logger.error("hf_api_error", status_code=response.status_code, text=response.text)
-                raise HTTPException(status_code=502, detail="Failed to generate embedding from Hugging Face API")
-        except Exception as e:
-            logger.error("hf_api_exception", error=str(e))
-            raise HTTPException(status_code=502, detail="Embedding generation timed out or failed")
+    logger.error("all_hf_endpoints_failed", last_error=last_error)
+    raise HTTPException(status_code=502, detail=f"Failed to generate embedding from Hugging Face: {last_error}")
 
 
 @router.post("", response_model=SearchResponse)
@@ -74,7 +81,7 @@ async def hybrid_search(request: SearchRequest):
     if not request.query or len(request.query.strip()) < 2:
         raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
 
-    # Generate query embedding using HF free API (No PyTorch loaded in memory!)
+    # Generate query embedding using HF free API with automatic DNS fallback routing (No PyTorch loaded in memory!)
     query_embedding = await get_query_embedding_from_api(request.query)
 
     # Perform hybrid search with RRF on Elastic Serverless
