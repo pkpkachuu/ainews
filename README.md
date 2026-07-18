@@ -6,12 +6,6 @@ proactively surfaces emerging topics and shifting narratives — without
 requiring the user to search for anything. Includes hybrid (keyword +
 semantic) search with cross-encoder reranking, and an LLM-powered analyst
 that can generate timelines and explain why a topic is trending.
-
-> **Status:** This is an MVP built during an internship project. It runs
-> fully locally on free-tier services. It is not production-hardened —
-> see [Known Issues & Housekeeping](#known-issues--housekeeping) below for
-> exactly what that means in practice.
-
 ---
 
 ## Features
@@ -59,43 +53,28 @@ that can generate timelines and explain why a topic is trending.
 
 ## Requirements
 
-### Must already exist on your machine
 - **Python 3.11+**
 - **Node.js 18+** and npm
 - **Docker Desktop** (running Redis and Elasticsearch as containers)
 - **git**
+- A [Supabase](https://supabase.com) account (free tier)
+- A [Groq](https://console.groq.com) account (free tier, for the LLM API key)
 
-### External accounts (free tier is enough)
-- A [Supabase](https://supabase.com) account (PostgreSQL database)
-- A [Groq](https://console.groq.com) account (LLM API key)
-
-### Platform notes
-- `torch==2.4.1` is a heavy download (several hundred MB). First `pip
-  install` will take a while — this is expected, not a hang.
-- All Python dependencies in `requirements.txt` install cleanly on
-  macOS (including Apple Silicon), Linux, and Windows without needing
-  platform-specific substitutions.
-- No GPU is required or used. Model choices were deliberately picked to
-  run acceptably on CPU-only hardware.
+No GPU is required. `torch` is a large download (a few hundred MB) — the
+first `pip install` will take a while, that's expected.
 
 ---
 
 ## Installation
 
-### macOS
-
 ```bash
-# Prerequisites (if not already installed)
-brew install python@3.11 node git
-# Install Docker Desktop from https://www.docker.com/products/docker-desktop/
-
-git clone <your-repo-url>
-cd <repo-folder>
+git clone https://github.com/pkpkachuu/ainews
+cd ainews
 
 # Backend
 cd backend
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 cd ..
@@ -104,48 +83,15 @@ cd ..
 npm install
 ```
 
-### Ubuntu / Linux
+That's it for installation. Configuration (Supabase project, API keys,
+`.env` files) and actually running the app are covered in the next two
+sections.
 
-```bash
-sudo apt update
-sudo apt install python3.11 python3.11-venv python3-pip nodejs npm git
-# Install Docker: https://docs.docker.com/engine/install/ubuntu/
-
-git clone <your-repo-url>
-cd <repo-folder>
-
-cd backend
-python3.11 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python -m spacy download en_core_web_sm
-cd ..
-
-npm install
-```
-
-### Windows
-
-Windows works, but running the backend inside **WSL2** (Windows Subsystem
-for Linux) is noticeably smoother than native Windows for this stack —
-Docker Desktop integrates with WSL2 directly. If you'd rather run natively:
-
-```powershell
-# Prerequisites: Python 3.11+, Node 18+, git, Docker Desktop — install from
-# their official Windows installers.
-
-git clone <your-repo-url>
-cd <repo-folder>
-
-cd backend
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-python -m spacy download en_core_web_sm
-cd ..
-
-npm install
-```
+*(macOS: if `python3`/`node` aren't installed, `brew install python@3.11 node`
+first. Ubuntu: `sudo apt install python3.11 python3.11-venv nodejs npm` first.
+Windows: running the backend inside WSL2 is smoother than native Windows for
+this stack, but native works too — Docker Desktop integrates with WSL2
+directly if you go that route.)*
 
 ---
 
@@ -195,7 +141,7 @@ From [console.groq.com/keys](https://console.groq.com/keys), create a key
 cp backend/.env.example backend/.env
 # edit backend/.env with the real values collected above
 
-cp src/.env.example .env
+cp .env.example .env
 # the default (http://localhost:8000) is correct unless you're running
 # the backend on a different port or host
 ```
@@ -227,12 +173,10 @@ Never commit either `.env` file (both are already gitignored).
 |---|---|---|---|
 | `VITE_API_URL` | No | `http://localhost:8000` | Backend base URL. Defaults to `http://localhost:8000` in code if unset, so this file can be empty for local development |
 
-> **Note:** You may see `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY`
-> referenced in older versions of this project's `.env`. The frontend does
-> **not** actually use these — it talks exclusively to the FastAPI backend,
-> which is the only thing that talks to Supabase. The `@supabase/supabase-js`
-> package in `package.json` is an unused leftover dependency; it is safe to
-> remove along with those two variables if you want to clean up further.
+> **Note:** older versions of this project's `.env` may reference
+> `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY`. The frontend does **not**
+> actually use these — it talks exclusively to the FastAPI backend, which is
+> the only thing that talks to Supabase.
 
 ---
 
@@ -371,7 +315,7 @@ Then refresh the Intelligence Feed tab in the browser.
 ├── src/                     # React frontend
 │   ├── App.tsx              # all views live in this single file
 │   ├── main.tsx
-│   └── .env.example
+├── .env.example
 ├── supabase/
 │   └── migrations/          # run these manually — see Configuration
 ├── .bolt/                   # Bolt.new IDE scaffold config — harmless, safe to delete
@@ -571,7 +515,7 @@ one-time backlog fetch of older articles will legitimately show 0% until
 you fetch again and let time pass.
 
 **CORS errors from the frontend**
-Shouldn't happen locally — CORS is currently wide open
+Shouldn't happen locally, CORS is currently wide open
 (`allow_origins=["*"]` in `main.py`) for development convenience. If you
 see a CORS error, double-check `VITE_API_URL` actually points at your
 running backend.
@@ -585,23 +529,6 @@ lsof -ti :5173 | xargs kill -9   # frontend
 **Permission errors on macOS/Linux running Docker commands**
 Ensure Docker Desktop is actually running (not just installed) and your
 user has permission to use the Docker socket.
-
----
-
-## Known Issues & Housekeeping
-
-None of these block normal use, but are worth knowing about:
-
-- `@supabase/supabase-js` in `package.json` and `database_client.py` in
-  the backend are both dead/unused code, safe to remove.
-- `apscheduler` in `requirements.txt` is installed but never imported or
-  wired up anywhere.
-- `backend/requeue_pending.py` is a one-off debugging script written
-  during development, not part of the running application.
-- `.bolt/` is leftover Bolt.new IDE scaffold configuration; harmless, safe
-  to delete if you're not using Bolt.
-- CORS is wide open (`allow_origins=["*"]`) — fine for local development,
-  should be restricted before any real deployment.
 
 ---
 
