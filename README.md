@@ -1,11 +1,11 @@
 # AI-Powered Intelligent News Analytics & Agentic Search Platform
-----
+---
 - An intelligent news analytics system that ingests live RSS feeds, enriches
 every article with NLP (entities, sentiment, keyphrases, embeddings), and
 proactively surfaces emerging topics and shifting narratives — without
 requiring the user to search for anything. Includes hybrid (keyword +
 semantic) search with cross-encoder reranking, and an LLM-powered analyst
-that can generate timelines and explain why a topic is trending.
+that can generate timelines and explain why a topic is trending.******
 ---
 
 ## Features
